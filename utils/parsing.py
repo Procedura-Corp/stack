@@ -460,3 +460,109 @@ def normalize_directive_tokens(tokens: list[str]) -> list[str]:
     # 7) compact dump → single argv token
     one_token = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     return [one_token]
+
+# ─── coordinate sniffing ───────────────────────────────────────────
+
+_LATLON_RE = re.compile(
+    r"""
+    \b
+    (-?\d{1,3}(?:\.\d+)?)      # latitude
+    \s*,\s*
+    (-?\d{1,3}(?:\.\d+)?)      # longitude
+    \b
+    """,
+    re.VERBOSE,
+)
+
+
+def sniff_latlon_from_text(text: str) -> tuple[float, float] | None:
+    """
+    Try to find a 'lat, lon' pair inside an arbitrary string.
+
+    Returns:
+        (lat, lon) as floats if a valid pair is found and passes sanity
+        checks (-90<=lat<=90, -180<=lon<=180), otherwise None.
+    """
+    if not text:
+        return None
+
+    m = _LATLON_RE.search(str(text))
+    if not m:
+        return None
+
+    lat = float(m.group(1))
+    lon = float(m.group(2))
+
+    # Basic sanity bounds
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+
+    return lat, lon
+
+
+def sniff_latlon_from_payload(payload: Any) -> tuple[float, float] | None:
+    """
+    Try to extract (lat, lon) from a JSON-like payload.
+
+    Order of preference:
+      1) explicit 'latlon' field: [lat, lon]
+      2) structured 'location.{latitude,longitude}' or 'data.location.*'
+      3) top-level 'lat{,itude}' / 'lon{,g,gitute}'
+      4) regex on description/text-like fields
+
+    Returns:
+        (lat, lon) as floats if found and sane, otherwise None.
+    """
+    if payload is None:
+        return None
+
+    # 0) Explicit 'latlon' field
+    if isinstance(payload, dict):
+        latlon = payload.get("latlon")
+        if isinstance(latlon, (list, tuple)) and len(latlon) == 2:
+            try:
+                lat_f = float(latlon[0])
+                lon_f = float(latlon[1])
+            except (TypeError, ValueError):
+                lat_f = lon_f = None
+            else:
+                if -90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0:
+                    return lat_f, lon_f
+
+    def _extract_latlon_from_mapping(obj: Any) -> tuple[float, float] | None:
+        if not isinstance(obj, dict):
+            return None
+
+        lat = obj.get("latitude") or obj.get("lat")
+        lon = obj.get("longitude") or obj.get("lon") or obj.get("lng") or obj.get("long")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return None
+
+        lat_f = float(lat)
+        lon_f = float(lon)
+        if -90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0:
+            return lat_f, lon_f
+        return None
+
+    # 1) structured nested locations
+    for base in ("location", "data.location", "meta.location"):
+        loc = get_nested(payload, base, default=None)
+        maybe = _extract_latlon_from_mapping(loc) if loc is not None else None
+        if maybe is not None:
+            return maybe
+
+    # 2) top-level mapping
+    if isinstance(payload, dict):
+        maybe = _extract_latlon_from_mapping(payload)
+        if maybe is not None:
+            return maybe
+
+        # 3) textual description / fallback
+        for key in ("description", "text", "body", "message"):
+            val = payload.get(key)
+            if isinstance(val, str):
+                maybe = sniff_latlon_from_text(val)
+                if maybe is not None:
+                    return maybe
+
+    return None
